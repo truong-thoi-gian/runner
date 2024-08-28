@@ -9,6 +9,8 @@ use serde_json::Value;
 use warp::Filter;
 use std::error::Error;
 use tokio::process::Command;
+use std::process::Command as StdCommand;
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Debug, Deserialize)]
 struct FormData {
@@ -57,20 +59,97 @@ async fn handle_form_submission(form_data: FormData) -> Result<String, warp::Rej
             file.write_all(script.as_str().unwrap_or("").as_bytes()).map_err(|_| warp::reject::custom(CustomError("Failed to write to file".into())))?;
         }
 
-        let additional_code = r#"
+        // Download chromedriver based on the OS
+        let (chromedriver_url, zip_name, executable_name, output_folder) = match std::env::consts::OS {
+            "windows" => (
+                "https://storage.googleapis.com/chrome-for-testing-public/128.0.6613.84/win32/chromedriver-win32.zip",
+                "chromedriver_win32.zip",
+                "chromedriver.exe",
+                "chromedriver-win-x32"
+            ),
+            "macos" => (
+                "https://storage.googleapis.com/chrome-for-testing-public/128.0.6613.84/mac-x64/chromedriver-mac-x64.zip",
+                "chromedriver_mac64.zip",
+                "chromedriver",
+                "chromedriver-mac-x64"
+            ),
+            "linux" => (
+                "https://storage.googleapis.com/chrome-for-testing-public/128.0.6613.84/linux64/chromedriver-linux64.zip",
+                "chromedriver_linux64.zip",
+                "chromedriver",
+                "chromedriver-linux-x64"
+            ),
+            _ => return Err(warp::reject::custom(CustomError("Unsupported OS".into()))),
+        };
+
+        let zip_path = Path::new(subfolder).join(zip_name);
+        let chromedriver_path = Path::new(subfolder).join(executable_name);
+
+        println!("Chromedriver path: {}", chromedriver_path.display());
+
+        if !chromedriver_path.exists() {
+            // Download chromedriver
+            let resp = reqwest::get(chromedriver_url)
+                .await
+                .map_err(|_| warp::reject::custom(CustomError("Failed to download chromedriver".into())))?;
+    
+            // Convert response body to bytes
+            let bytes = resp.bytes().await.map_err(|_| warp::reject::custom(CustomError("Failed to read response bytes".into())))?;
+    
+            // Write bytes to zip file
+            let mut out = File::create(zip_path.clone())
+                .map_err(|_| warp::reject::custom(CustomError("Failed to create chromedriver zip file".into())))?;
+            out.write_all(&bytes)
+                .map_err(|_| warp::reject::custom(CustomError("Failed to write chromedriver zip file".into())))?;
+    
+            // Unzip chromedriver
+            let output = StdCommand::new("unzip")
+                .arg(zip_path.clone())
+                .current_dir("./")
+                .output()
+                .map_err(|_| warp::reject::custom(CustomError("Failed to unzip chromedriver".into())))?;
+    
+            if !output.status.success() {
+                return Err(warp::reject::custom(CustomError(format!(
+                    "Unzip error: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ))));
+            }
+
+            let source_path = Path::new(output_folder).join(executable_name);
+            let destination_path = Path::new(subfolder).join(executable_name);
+
+            fs::copy(source_path, destination_path).map_err(|_| warp::reject::custom(CustomError("Failed to copy file permissions".into())))?;
+    
+            // Remove zip file
+            fs::remove_file(zip_path).map_err(|_| warp::reject::custom(CustomError("Failed to remove zip file".into())))?;
+    
+            // Set executable permissions for macOS and Linux
+            if std::env::consts::OS != "windows" {
+                fs::set_permissions(chromedriver_path, fs::Permissions::from_mode(0o755))
+                    .map_err(|_| warp::reject::custom(CustomError("Failed to set executable permissions".into())))?;
+            }
+        }
+
+        let additional_code = format!(r#"
 from selenium import webdriver
 from selenium.common.exceptions import (NoAlertPresentException,
                                         UnexpectedAlertPresentException)
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+import os
+
+# Path to chromedriver
+chromedriver_path = os.path.join(os.path.dirname(__file__), '{executable_name}')
 
 options = Options()
 # options.binary_location = Setting.BINARY_LOCATION
-options.add_experimental_option("prefs", {"intl.accept_languages": "en_US"})
 options.add_argument("--no-sandbox")
-driver = webdriver.Chrome(options=options)
+service = Service(executable_path=chromedriver_path)
+driver = webdriver.Chrome(service=service, options=options)
 
 create_issue(driver)
-"#;
+"#, executable_name = executable_name);
 
         let mut file = OpenOptions::new()
             .append(true)
@@ -143,3 +222,4 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
